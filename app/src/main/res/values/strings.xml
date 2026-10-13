@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AutoCopy</string>
+    <string name="accessibility_desc">自动点击“复制”并保存剪贴板内容到 txt</string>
+</resources>
