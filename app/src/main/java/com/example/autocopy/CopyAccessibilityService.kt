@@ -5,6 +5,7 @@ import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
@@ -24,8 +25,8 @@ class CopyAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "AutoCopy"
-        private const val MAX_DEPTH = 30
-        private const val MAX_NODES = 3000
+        private const val MAX_DEPTH = 40
+        private const val MAX_NODES = 5000
     }
 
     private var windowManager: WindowManager? = null
@@ -64,6 +65,7 @@ class CopyAccessibilityService : AccessibilityService() {
             x = 20
         }
 
+        // 单击 = 复制并保存
         floatView!!.setOnClickListener {
             Log.d(TAG, "float button clicked")
             try {
@@ -73,11 +75,29 @@ class CopyAccessibilityService : AccessibilityService() {
                 toast("出错：" + e.message)
             }
         }
+
+        // 长按 = 把当前节点树 dump 到文件
+        floatView!!.setOnLongClickListener {
+            toast("开始 dump，请稍等")
+            handler.postDelayed({
+                try {
+                    val path = dumpAllWindowsToFile()
+                    toast("Dump 完成：$path")
+                } catch (e: Exception) {
+                    Log.e(TAG, "dump failed", e)
+                    toast("Dump 失败：" + e.message)
+                }
+            }, 600)
+            true
+        }
+
         windowManager!!.addView(floatView, params)
     }
 
+    // ---------------- 复制逻辑 ----------------
+
     private fun doCopyAndSave() {
-        // 路径 1：直接对当前焦点节点执行 ACTION_COPY
+        // 路径 1：对焦点节点直接 ACTION_COPY
         val focus = findFocusNode()
         Log.d(TAG, "focus node = $focus")
         if (focus != null) {
@@ -87,17 +107,16 @@ class CopyAccessibilityService : AccessibilityService() {
                 handler.postDelayed({ saveClipboard() }, 400)
                 return
             }
-            // 焦点节点不支持 COPY，直接往下走找按钮
         }
 
-        // 路径 2：找“复制”按钮并点
+        // 路径 2：找“复制”按钮点
         if (clickByText("复制", "Copy", "拷贝", "复制文本")) {
             Log.d(TAG, "clicked 复制")
             handler.postDelayed({ saveClipboard() }, 400)
             return
         }
 
-        // 路径 3：找“全选”按钮点，再找“复制”
+        // 路径 3：找“全选”点，再找“复制”
         if (clickByText("全选", "Select all", "全选文本")) {
             Log.d(TAG, "clicked 全选, waiting for copy button")
             handler.postDelayed({
@@ -105,7 +124,7 @@ class CopyAccessibilityService : AccessibilityService() {
                     Log.d(TAG, "clicked 复制 after 全选")
                 } else {
                     Log.d(TAG, "copy button not found after 全选")
-                    toast("没找到复制按钮")
+                    toast("没找到复制按钮，可长按悬浮按钮 dump 节点")
                 }
                 handler.postDelayed({ saveClipboard() }, 400)
             }, 500)
@@ -113,7 +132,7 @@ class CopyAccessibilityService : AccessibilityService() {
         }
 
         Log.d(TAG, "nothing found")
-        toast("没找到可复制的内容")
+        toast("没找到可复制的内容，可长按悬浮按钮 dump 节点")
     }
 
     private fun findFocusNode(): AccessibilityNodeInfo? {
@@ -211,6 +230,96 @@ class CopyAccessibilityService : AccessibilityService() {
             toast("保存失败：" + e.message)
         }
     }
+
+    // ---------------- Dump 节点到文件 ----------------
+
+    private fun dumpAllWindowsToFile(): String {
+        val sb = StringBuilder()
+        sb.append("===== DUMP START =====\n")
+        sb.append("time=").append(System.currentTimeMillis()).append("\n\n")
+
+        try {
+            val ws = windows
+            sb.append("windows count = ").append(ws?.size ?: 0).append("\n")
+            ws?.forEachIndexed { i, w ->
+                sb.append("--- window[$i] type=").append(w.type)
+                    .append(" root=").append(w.root).append("\n")
+                appendNode(sb, w.root, 0)
+            }
+        } catch (e: Exception) {
+            sb.append("windows() failed: ").append(e.message).append("\n")
+        }
+
+        sb.append("\n--- active window root ---\n")
+        appendNode(sb, rootInActiveWindow, 0)
+
+        sb.append("===== DUMP END =====\n")
+
+        val fileName = "dump_${System.currentTimeMillis()}.txt"
+        val path = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                put(MediaStore.MediaColumns.RELATIVE_PATH,
+                    Environment.DIRECTORY_DOWNLOADS + "/AutoCopy")
+            }
+            val uri = contentResolver.insert(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            contentResolver.openOutputStream(uri!!)?.use {
+                it.write(sb.toString().toByteArray())
+            }
+            "下载/AutoCopy/$fileName"
+        } else {
+            val dir = File(
+                Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS), "AutoCopy")
+            dir.mkdirs()
+            val f = File(dir, fileName)
+            f.writeText(sb.toString())
+            f.absolutePath
+        }
+
+        Log.d(TAG, "dumped to $path")
+        return path
+    }
+
+    private fun appendNode(sb: StringBuilder,
+                           node: AccessibilityNodeInfo?,
+                           depth: Int) {
+        if (node == null || depth > MAX_DEPTH) return
+
+        val text = node.text?.toString()?.replace("\n", "\\n") ?: ""
+        val desc = node.contentDescription?.toString()?.replace("\n", "\\n") ?: ""
+        val cls = node.className?.toString() ?: ""
+        val viewId = node.viewIdResourceName ?: ""
+        val bounds = Rect().also { node.getBoundsInScreen(it) }
+
+        val indent = "  ".repeat(depth)
+        if (text.isNotEmpty() || desc.isNotEmpty() || node.isClickable) {
+            sb.append(indent)
+                .append("cls=").append(cls)
+                .append(" click=").append(node.isClickable)
+                .append(" enabled=").append(node.isEnabled)
+                .append(" focus=").append(node.isFocused)
+                .append(" sel=").append(node.isSelected)
+                .append(" bounds=").append(bounds)
+                .append(" id=").append(viewId)
+                .append(" text=[").append(text).append("]")
+                .append(" desc=[").append(desc).append("]")
+                .append("\n")
+        }
+
+        for (i in 0 until node.childCount) {
+            try {
+                appendNode(sb, node.getChild(i), depth + 1)
+            } catch (e: Exception) {
+                sb.append(indent).append(" child ").append(i)
+                    .append(" failed: ").append(e.message).append("\n")
+            }
+        }
+    }
+
+    // ---------------- 通用 ----------------
 
     private fun toast(msg: String) {
         try {
