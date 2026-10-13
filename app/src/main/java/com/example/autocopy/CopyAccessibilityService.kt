@@ -87,13 +87,7 @@ class CopyAccessibilityService : AccessibilityService() {
                 handler.postDelayed({ saveClipboard() }, 400)
                 return
             }
-            // 试试 ACTION_SELECT_ALL 再 COPY
-            focus.performAction(AccessibilityNodeInfo.ACTION_SELECT_ALL)
-            handler.postDelayed({
-                focus.performAction(AccessibilityNodeInfo.ACTION_COPY)
-                handler.postDelayed({ saveClipboard() }, 400)
-            }, 300)
-            return
+            // 焦点节点不支持 COPY，直接往下走找按钮
         }
 
         // 路径 2：找“复制”按钮并点
