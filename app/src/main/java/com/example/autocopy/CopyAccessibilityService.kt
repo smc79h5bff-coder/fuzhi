@@ -5,6 +5,7 @@ import android.accessibilityservice.GestureDescription
 import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
@@ -13,6 +14,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.LayoutInflater
@@ -43,6 +45,7 @@ class CopyAccessibilityService : AccessibilityService() {
     private var floatView: View? = null
     // 记录用户在目标 App 里最后点击的位置，长按兜底时用
     private var lastClickBounds: Rect? = null
+    private var lastClickTime: Long = 0L
     private val handler = Handler(Looper.getMainLooper())
     private val bgHandler = Handler(
         android.os.HandlerThread("AutoCopyBg").apply { start() }.looper)
@@ -129,13 +132,19 @@ class CopyAccessibilityService : AccessibilityService() {
             true
         }
 
+        logLine("addView begin type=$type gravity=${params.gravity} x=${params.x}")
         windowManager!!.addView(floatView, params)
+        logLine("floating button attached")
     }
 
     // ---------------- 复制逻辑 ----------------
 
     private fun doCopyAndSave() {
         val before = clipboardText()
+        val activePkg = try { rootInActiveWindow?.packageName } catch (_: Throwable) { null }
+        logLine("== copy begin: activePkg=$activePkg " +
+                "clipboardBefore len=${before?.length ?: -1} lastClickAge=" +
+                ((System.currentTimeMillis() - lastClickTime) / 1000) + "s")
         val focus = safeFocusNode()
         logLine("focus node = $focus")
 
@@ -147,6 +156,7 @@ class CopyAccessibilityService : AccessibilityService() {
         }
 
         // 2) 屏幕上已有"复制"按钮（比如已长按弹出的选择菜单）
+        logLine("STEP2: look for existing 复制 button")
         if (clickByText("复制", "Copy", "拷贝", "复制文本")) {
             logLine("clicked 复制")
             Thread.sleep(400)
@@ -156,6 +166,7 @@ class CopyAccessibilityService : AccessibilityService() {
 
         // 3) 兜底：在焦点/最后点击位置模拟长按，唤出系统选择菜单再点复制
         //    这样 WebView、自绘控件等无障碍树里没有"复制"按钮的场景也能用
+        logLine("STEP3: long-press fallback")
         val bounds = lastClickBounds ?: nodeBounds(focus)
         if (bounds != null && longPressAt(bounds)) {
             logLine("long-press at $bounds, waiting for menu")
@@ -177,6 +188,7 @@ class CopyAccessibilityService : AccessibilityService() {
         }
 
         // 4) 屏幕上有"全选"（普通输入框场景）
+        logLine("STEP4: look for 全选 button")
         if (clickByText("全选", "Select all", "全选文本")) {
             logLine("clicked 全选, waiting for copy button")
             Thread.sleep(500)
@@ -223,8 +235,18 @@ class CopyAccessibilityService : AccessibilityService() {
                 moveTo(bounds.exactCenterX(), bounds.exactCenterY())
             }
             val stroke = GestureDescription.StrokeDescription(path, 0, 500)
-            dispatchGesture(
-                GestureDescription.Builder().addStroke(stroke).build(), null, null)
+            val ok = dispatchGesture(
+                GestureDescription.Builder().addStroke(stroke).build(),
+                object : GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        logLine("long-press gesture COMPLETED")
+                    }
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        logLine("long-press gesture CANCELLED（手势被系统取消，通常是用户触摸了屏幕）")
+                    }
+                }, null)
+            logLine("long-press dispatch ok=$ok")
+            ok
         } catch (e: Throwable) {
             logError("longPressAt", e)
             false
@@ -322,10 +344,11 @@ class CopyAccessibilityService : AccessibilityService() {
             // 剪贴板内容和复制前一样，说明复制动作实际没生效，
             // 读到的是上一次的内容，不能保存误导用户
             if (before != null && text == before) {
-                logLine("clipboard unchanged, copy likely failed")
+                logLine("clipboard UNCHANGED (len=${text.length}), copy likely failed")
                 toast("剪贴板没有变化，复制可能没生效")
                 return
             }
+            logLine("clipboard changed: len ${before?.length ?: -1} -> ${text.length}")
             val name = "copy_${System.currentTimeMillis()}.txt"
             val bytes = text.toByteArray()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -361,6 +384,7 @@ class CopyAccessibilityService : AccessibilityService() {
     // ---------------- Dump 到固定文件 ----------------
 
     private fun dumpAllWindowsToFile() {
+        logLine("dump requested")
         val sb = StringBuilder()
         dumpNodeCount.set(0)
         sb.append("===== DUMP START =====\n")
@@ -519,12 +543,51 @@ class CopyAccessibilityService : AccessibilityService() {
             try {
                 if (event.packageName == packageName) return
                 val r = Rect()
-                event.source?.getBoundsInScreen(r)
-                if (!r.isEmpty) lastClickBounds = r
+                val src = event.source
+                if (src == null) {
+                    logLine("TYPE_VIEW_CLICKED pkg=${event.packageName} source=null（无法记录位置）")
+                    return
+                }
+                src.getBoundsInScreen(r)
+                if (!r.isEmpty) {
+                    lastClickBounds = r
+                    lastClickTime = System.currentTimeMillis()
+                    logLine("lastClick recorded pkg=${event.packageName} bounds=$r")
+                }
             } catch (_: Throwable) {}
         }
     }
-    override fun onInterrupt() {}
+
+    override fun onInterrupt() {
+        logLine("onInterrupt —— 无障碍被系统中断（通常是另一个服务抢占）")
+    }
+
+    // ---- 生命周期埋点：用于定位"悬浮按钮消失"到底是哪种情况 ----
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        logLine("onUnbind —— 系统解绑（通常是设置里开关被关，或 ROM 杀后台前解绑）")
+        return super.onUnbind(intent)
+    }
+
+    override fun onRebind(intent: Intent?) {
+        logLine("onRebind —— 系统重新绑定")
+        super.onRebind(intent)
+    }
+
+    override fun onLowMemory() {
+        logLine("onLowMemory —— 系统内存告急，进程可能被杀")
+        super.onLowMemory()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        logLine("onTrimMemory level=$level")
+        super.onTrimMemory(level)
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        logLine("onTaskRemoved —— 用户/系统从最近任务移除")
+        super.onTaskRemoved(rootIntent)
+    }
 
     override fun onDestroy() {
         logLine("onDestroy —— 服务被销毁（如果是系统杀的，说明不是崩溃而是 ROM 杀后台/关开关）")
