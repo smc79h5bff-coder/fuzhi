@@ -17,6 +17,19 @@
             </intent-filter>
         </activity>
 
+        <!-- 系统选中菜单里的「复制保存」兜底入口 -->
+        <activity
+            android:name=".ProcessTextActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="复制保存"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.PROCESS_TEXT"/>
+                <data android:mimeType="text/plain"/>
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".CopyAccessibilityService"
             android:exported="true"
