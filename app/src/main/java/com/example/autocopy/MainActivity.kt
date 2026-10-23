@@ -14,6 +14,7 @@ import android.widget.Toast
 class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        DiagLog.init(this)
         setContentView(R.layout.activity_main)
 
         findViewById<Button>(R.id.btn_overlay).setOnClickListener {
@@ -38,11 +39,13 @@ class MainActivity : Activity() {
         val overlayOk = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
                 Settings.canDrawOverlays(this)
         val accOk = isAccessibilityServiceOn()
-        findViewById<TextView>(R.id.tv_status).text = when {
+        val status = when {
             accOk && overlayOk -> "● 服务运行中"
             !overlayOk -> "○ 缺少悬浮窗权限"
             else -> "○ 无障碍服务未开启（可能被系统杀后台关掉了，重新打开即可）"
         }
+        findViewById<TextView>(R.id.tv_status).text = status
+        DiagLog.i("MainActivity", "onResume: accOk=$accOk overlayOk=$overlayOk -> $status")
     }
 
     private fun isAccessibilityServiceOn(): Boolean {
