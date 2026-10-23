@@ -7,11 +7,19 @@
     android:gravity="center">
 
     <TextView
+        android:id="@+id/tv_status"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textSize="15sp"
+        android:layout_marginBottom="16dp"
+        android:text="○ 检查中…"/>
+
+    <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:textSize="16sp"
         android:layout_marginBottom="32dp"
-        android:text="使用步骤：\n1. 授予悬浮窗权限\n2. 开启无障碍服务\n3. 在任意 App 长按选中文字\n4. 点右侧悬浮按钮，自动复制并保存"/>
+        android:text="使用步骤：\n1. 授予悬浮窗权限\n2. 开启无障碍服务\n3. 在任意 App 长按选中文字\n4. 点右侧悬浮按钮，自动复制并保存\n\n悬浮按钮失灵时的兜底：\n长按选中文字后，点菜单里的「复制保存」"/>
 
     <Button
         android:id="@+id/btn_overlay"
