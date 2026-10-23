@@ -1,9 +1,11 @@
 package com.example.autocopy
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
 import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.os.Build
@@ -30,25 +32,49 @@ class CopyAccessibilityService : AccessibilityService() {
         private const val TAG = "AutoCopy"
         private const val MAX_DEPTH = 30
         private const val MAX_NODES = 3000
+        private const val MAX_DUMP_NODES = 8000
         private const val DIR_NAME = "AutoCopy"
         private const val LOG_FILE = "last_dump.txt"
-        private const val ERR_FILE = "error.txt"
     }
+
+    private val dumpNodeCount = java.util.concurrent.atomic.AtomicInteger(0)
 
     private var windowManager: WindowManager? = null
     private var floatView: View? = null
+    // 记录用户在目标 App 里最后点击的位置，长按兜底时用
+    private var lastClickBounds: Rect? = null
     private val handler = Handler(Looper.getMainLooper())
     private val bgHandler = Handler(
         android.os.HandlerThread("AutoCopyBg").apply { start() }.looper)
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        logLine("onServiceConnected")
+        DiagLog.init(this)
+        logLine("onServiceConnected —— 服务已连接")
+        logEnvSnapshot()
         try {
             showFloatingButton()
         } catch (e: Throwable) {
             logError("showFloatingButton", e)
             toast("悬浮窗创建失败：" + e.message)
+        }
+    }
+
+    /** 连接时记录环境快照，方便对照"哪个机型/什么权限状态下出问题" */
+    private fun logEnvSnapshot() {
+        try {
+            DiagLog.i(TAG, "device=${Build.MANUFACTURER} ${Build.MODEL} " +
+                    "android=${Build.VERSION.RELEASE}(sdk ${Build.VERSION.SDK_INT})")
+            val overlayOk = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+                    Settings.canDrawOverlays(this)
+            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            DiagLog.i(TAG, "overlayPermission=$overlayOk " +
+                    "batteryOptIgnored=${pm.isIgnoringBatteryOptimizations(packageName)}")
+            val si = serviceInfo
+            DiagLog.i(TAG, "serviceInfo events=${si?.eventTypes} " +
+                    "flags=${si?.flags} capabilities=${si?.capabilities}")
+        } catch (e: Throwable) {
+            logError("logEnvSnapshot", e)
         }
     }
 
@@ -109,29 +135,48 @@ class CopyAccessibilityService : AccessibilityService() {
     // ---------------- 复制逻辑 ----------------
 
     private fun doCopyAndSave() {
+        val before = clipboardText()
         val focus = safeFocusNode()
         logLine("focus node = $focus")
-        if (focus != null) {
-            val ok = try {
-                focus.performAction(AccessibilityNodeInfo.ACTION_COPY)
-            } catch (e: Throwable) {
-                logError("ACTION_COPY", e); false
-            }
-            logLine("ACTION_COPY on focus = $ok")
-            if (ok) {
+
+        // 1) 焦点在输入框/文本上：有选中文字直接复制，没选中先全选再复制
+        if (focus != null && tryCopyFromFocus(focus)) {
+            Thread.sleep(400)
+            saveClipboard(before)
+            return
+        }
+
+        // 2) 屏幕上已有"复制"按钮（比如已长按弹出的选择菜单）
+        if (clickByText("复制", "Copy", "拷贝", "复制文本")) {
+            logLine("clicked 复制")
+            Thread.sleep(400)
+            saveClipboard(before)
+            return
+        }
+
+        // 3) 兜底：在焦点/最后点击位置模拟长按，唤出系统选择菜单再点复制
+        //    这样 WebView、自绘控件等无障碍树里没有"复制"按钮的场景也能用
+        val bounds = lastClickBounds ?: nodeBounds(focus)
+        if (bounds != null && longPressAt(bounds)) {
+            logLine("long-press at $bounds, waiting for menu")
+            Thread.sleep(800)
+            if (clickByText("复制", "Copy", "拷贝", "复制文本")) {
+                logLine("clicked 复制 after long-press")
                 Thread.sleep(400)
-                saveClipboard()
+                saveClipboard(before)
+                return
+            }
+            if (clickByText("全选", "Select all", "全选文本")) {
+                logLine("clicked 全选 after long-press")
+                Thread.sleep(500)
+                clickByText("复制", "Copy", "拷贝", "复制文本")
+                Thread.sleep(400)
+                saveClipboard(before)
                 return
             }
         }
 
-        if (clickByText("复制", "Copy", "拷贝", "复制文本")) {
-            logLine("clicked 复制")
-            Thread.sleep(400)
-            saveClipboard()
-            return
-        }
-
+        // 4) 屏幕上有"全选"（普通输入框场景）
         if (clickByText("全选", "Select all", "全选文本")) {
             logLine("clicked 全选, waiting for copy button")
             Thread.sleep(500)
@@ -142,12 +187,66 @@ class CopyAccessibilityService : AccessibilityService() {
                 toast("没找到复制按钮，长按悬浮按钮看 dump 文件")
             }
             Thread.sleep(400)
-            saveClipboard()
+            saveClipboard(before)
             return
         }
 
         logLine("nothing found")
         toast("没找到可复制的内容，长按悬浮按钮看 dump 文件")
+    }
+
+    private fun tryCopyFromFocus(f: AccessibilityNodeInfo): Boolean {
+        return try {
+            val start = f.textSelectionStart
+            val end = f.textSelectionEnd
+            val hasSelection = start >= 0 && start != end
+            if (!hasSelection && !f.isEditable) {
+                logLine("focus has no selection and is not editable, skip")
+                return false
+            }
+            if (!hasSelection) {
+                if (!f.performAction(AccessibilityNodeInfo.ACTION_SELECT_ALL)) return false
+                Thread.sleep(150)
+            }
+            val ok = f.performAction(AccessibilityNodeInfo.ACTION_COPY)
+            logLine("focus copy hasSel=$hasSel editable=${f.isEditable} ok=$ok")
+            ok
+        } catch (e: Throwable) {
+            logError("tryCopyFromFocus", e)
+            false
+        }
+    }
+
+    private fun longPressAt(bounds: Rect): Boolean {
+        return try {
+            val path = Path().apply {
+                moveTo(bounds.exactCenterX(), bounds.exactCenterY())
+            }
+            val stroke = GestureDescription.StrokeDescription(path, 0, 500)
+            dispatchGesture(
+                GestureDescription.Builder().addStroke(stroke).build(), null, null)
+        } catch (e: Throwable) {
+            logError("longPressAt", e)
+            false
+        }
+    }
+
+    private fun nodeBounds(n: AccessibilityNodeInfo?): Rect? {
+        if (n == null) return null
+        return try {
+            val r = Rect()
+            n.getBoundsInScreen(r)
+            if (r.isEmpty) null else r
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun clipboardText(): String? = try {
+        (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+            .primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
+    } catch (_: Throwable) {
+        null
     }
 
     private fun safeFocusNode(): AccessibilityNodeInfo? {
@@ -212,13 +311,19 @@ class CopyAccessibilityService : AccessibilityService() {
         return false
     }
 
-    private fun saveClipboard() {
+    private fun saveClipboard(before: String?) {
         try {
-            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            val text = cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
+            val text = clipboardText()
             if (text.isNullOrEmpty()) {
                 logLine("clipboard empty")
                 toast("剪贴板为空，复制没生效")
+                return
+            }
+            // 剪贴板内容和复制前一样，说明复制动作实际没生效，
+            // 读到的是上一次的内容，不能保存误导用户
+            if (before != null && text == before) {
+                logLine("clipboard unchanged, copy likely failed")
+                toast("剪贴板没有变化，复制可能没生效")
                 return
             }
             val name = "copy_${System.currentTimeMillis()}.txt"
@@ -257,6 +362,7 @@ class CopyAccessibilityService : AccessibilityService() {
 
     private fun dumpAllWindowsToFile() {
         val sb = StringBuilder()
+        dumpNodeCount.set(0)
         sb.append("===== DUMP START =====\n")
         sb.append("time=").append(nowStr()).append("\n\n")
 
@@ -291,6 +397,11 @@ class CopyAccessibilityService : AccessibilityService() {
                            node: AccessibilityNodeInfo?,
                            depth: Int) {
         if (node == null || depth > MAX_DEPTH) return
+        // 无上限遍历复杂页面（如大 WebView）会 OOM 把服务杀掉，导致悬浮按钮消失
+        if (dumpNodeCount.incrementAndGet() > MAX_DUMP_NODES) {
+            sb.append("  ...max dump nodes reached\n")
+            return
+        }
 
         val text = try { node.text?.toString()?.replace("\n", "\\n") ?: "" }
                    catch (_: Throwable) { "" }
@@ -381,25 +492,11 @@ class CopyAccessibilityService : AccessibilityService() {
     }
 
     private fun logLine(s: String) {
-        try {
-            Log.d(TAG, s)
-            val dir = File(getExternalFilesDir(null), DIR_NAME)
-            dir.mkdirs()
-            val f = File(dir, "log.txt")
-            f.appendText("[${nowStr()}] $s\n")
-        } catch (_: Throwable) {}
+        DiagLog.i(TAG, s)
     }
 
     private fun logError(where: String, e: Throwable) {
-        try {
-            Log.e(TAG, "$where failed", e)
-            val dir = File(getExternalFilesDir(null), DIR_NAME)
-            dir.mkdirs()
-            File(dir, ERR_FILE).appendText(
-                "[${nowStr()}] $where: ${e.javaClass.simpleName}: ${e.message}\n" +
-                e.stackTraceToString() + "\n\n"
-            )
-        } catch (_: Throwable) {}
+        DiagLog.e(TAG, "$where failed", e)
     }
 
     private fun nowStr(): String =
@@ -415,14 +512,78 @@ class CopyAccessibilityService : AccessibilityService() {
         } catch (_: Throwable) {}
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // 记录用户在目标 App 里最后点击的位置（排除自己悬浮按钮的点击），
+        // 供复制兜底时模拟长按使用
+        if (event?.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
+            try {
+                if (event.packageName == packageName) return
+                val r = Rect()
+                event.source?.getBoundsInScreen(r)
+                if (!r.isEmpty) lastClickBounds = r
+            } catch (_: Throwable) {}
+        }
+    }
     override fun onInterrupt() {}
 
     override fun onDestroy() {
+        logLine("onDestroy —— 服务被销毁（如果是系统杀的，说明不是崩溃而是 ROM 杀后台/关开关）")
         try {
             floatView?.let { windowManager?.removeView(it) }
         } catch (_: Throwable) {}
         floatView = null
         super.onDestroy()
+    }
+}
+
+/**
+ * 统一诊断日志：
+ * - 所有日志写入一个文件，方便排查悬浮按钮消失、复制失败等问题
+ * - 文件位置：/sdcard/Android/data/com.example.autocopy/files/AutoCopy/diag.log
+ * - 后台线程写入，超过 1MB 自动轮转为 diag.old.log
+ */
+object DiagLog {
+    private const val DIR_NAME = "AutoCopy"
+    private const val FILE_NAME = "diag.log"
+    private const val MAX_BYTES = 1L shl 20 // 1MB 轮转
+
+    private var ctx: Context? = null
+    private val handler by lazy {
+        Handler(android.os.HandlerThread("AutoCopyDiag").apply { start() }.looper)
+    }
+
+    fun init(context: Context) {
+        ctx = context.applicationContext
+    }
+
+    fun i(tag: String, msg: String) = write("I", tag, msg, null)
+    fun e(tag: String, msg: String, err: Throwable? = null) = write("E", tag, msg, err)
+
+    private fun write(level: String, tag: String, msg: String, err: Throwable?) {
+        try {
+            Log.println(if (level == "E") Log.ERROR else Log.DEBUG, tag, msg)
+        } catch (_: Throwable) {}
+        val c = ctx ?: return
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+        val line = buildString {
+            append('[').append(time).append("] ").append(level).append('/')
+                .append(tag).append(": ").append(msg).append('\n')
+            if (err != null) {
+                append(Log.getStackTraceString(err)).append('\n')
+            }
+        }
+        handler.post {
+            try {
+                val dir = File(c.getExternalFilesDir(null), DIR_NAME)
+                dir.mkdirs()
+                val f = File(dir, FILE_NAME)
+                if (f.length() > MAX_BYTES) {
+                    val old = File(dir, "diag.old.log")
+                    if (old.exists()) old.delete()
+                    f.renameTo(old)
+                }
+                f.appendText(line)
+            } catch (_: Throwable) {}
+        }
     }
 }
