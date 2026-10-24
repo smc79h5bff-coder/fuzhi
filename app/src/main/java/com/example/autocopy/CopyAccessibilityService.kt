@@ -10,6 +10,7 @@ import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
@@ -217,11 +218,25 @@ class CopyAccessibilityService : AccessibilityService() {
                 return false
             }
             if (!hasSelection) {
-                if (!f.performAction(AccessibilityNodeInfo.ACTION_SELECT_ALL)) return false
+                // 没有选中文字时先全选：用 ACTION_SET_SELECTION 把选区设为 0..文本长度
+                val len = f.text?.length ?: 0
+                if (len <= 0) {
+                    logLine("focus has no text, cannot select all")
+                    return false
+                }
+                val args = Bundle().apply {
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, len)
+                }
+                if (!f.performAction(
+                        AccessibilityNodeInfo.ACTION_SET_SELECTION, args)) {
+                    logLine("ACTION_SET_SELECTION failed, len=$len")
+                    return false
+                }
                 Thread.sleep(150)
             }
             val ok = f.performAction(AccessibilityNodeInfo.ACTION_COPY)
-            logLine("focus copy hasSel=$hasSel editable=${f.isEditable} ok=$ok")
+            logLine("focus copy hasSelection=$hasSelection editable=${f.isEditable} ok=$ok")
             ok
         } catch (e: Throwable) {
             logError("tryCopyFromFocus", e)
