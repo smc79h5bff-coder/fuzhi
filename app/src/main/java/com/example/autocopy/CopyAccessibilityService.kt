@@ -1,7 +1,9 @@
 package com.example.autocopy
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
@@ -41,6 +43,8 @@ class CopyAccessibilityService : AccessibilityService() {
     }
 
     private val dumpNodeCount = java.util.concurrent.atomic.AtomicInteger(0)
+    /** 防止复制流程被重入（自己点到自己会无限递归） */
+    private val copyInProgress = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private var windowManager: WindowManager? = null
     private var floatView: View? = null
@@ -106,6 +110,12 @@ class CopyAccessibilityService : AccessibilityService() {
 
         // 单击 = 复制并保存
         floatView!!.setOnClickListener {
+            // 防重入：复制流程里会去点屏幕上的"复制"按钮，
+            // 如果误命中自己就会反复触发，这里做一道硬锁
+            if (!copyInProgress.compareAndSet(false, true)) {
+                logLine("copy still running, ignore click")
+                return@setOnClickListener
+            }
             logLine("float button CLICK")
             bgHandler.post {
                 try {
@@ -113,6 +123,8 @@ class CopyAccessibilityService : AccessibilityService() {
                 } catch (e: Throwable) {
                     logError("doCopyAndSave", e)
                     toast("出错：" + e.message)
+                } finally {
+                    copyInProgress.set(false)
                 }
             }
         }
@@ -149,6 +161,17 @@ class CopyAccessibilityService : AccessibilityService() {
         val focus = safeFocusNode()
         logLine("focus node = $focus")
 
+        // 0) 最优先：直接从无障碍树读出"当前已被选中的文字"。
+        //    这是为了覆盖系统工具栏消失的场景（比如点了全选后菜单没了），
+        //    不依赖剪贴板、不依赖手势、不依赖任何"复制"按钮
+        val selectedText = readSelectedText()
+        if (!selectedText.isNullOrEmpty()) {
+            logLine("STEP0: 读到选中文字 len=${selectedText.length}")
+            saveTextDirectly(selectedText, "选中文字")
+            return
+        }
+        logLine("STEP0: 树里没有选中状态，继续找复制按钮")
+
         // 1) 焦点在输入框/文本上：有选中文字直接复制，没选中先全选再复制
         if (focus != null && tryCopyFromFocus(focus)) {
             Thread.sleep(400)
@@ -165,11 +188,37 @@ class CopyAccessibilityService : AccessibilityService() {
             return
         }
 
+        // 2.5) WebView 这类容器有时只支持 ACTION_SELECT：
+        //      先让它进入选择态，再找随后的"复制"按钮
+        if (focus != null) {
+            val selected = try {
+                focus.performAction(AccessibilityNodeInfo.ACTION_SELECT)
+            } catch (_: Throwable) { false }
+            logLine("STEP2.5: ACTION_SELECT ok=$selected")
+            if (selected) {
+                Thread.sleep(400)
+                if (clickByText("复制", "Copy", "拷贝", "复制文本")) {
+                    logLine("clicked 复制 after ACTION_SELECT")
+                    Thread.sleep(400)
+                    saveClipboard(before)
+                    return
+                }
+            }
+        }
+
         // 3) 兜底：在焦点/最后点击位置模拟长按，唤出系统选择菜单再点复制
         //    这样 WebView、自绘控件等无障碍树里没有"复制"按钮的场景也能用
         logLine("STEP3: long-press fallback")
+        val caps = try { serviceInfo?.capabilities ?: 0 } catch (_: Throwable) { 0 }
+        val canGesture = (caps and
+                AccessibilityServiceInfo.CAPABILITY_CAN_PERFORM_GESTURES) != 0
+        if (!canGesture) {
+            logLine("WARN: 系统未授予手势注入能力(capabilities=$caps)，长按兜底无效，请关闭再重新开启无障碍服务")
+        }
+        // 桌面上一次点击位置；没有的话退到焦点控件中心（WebView 全屏时即屏幕中心）
         val bounds = lastClickBounds ?: nodeBounds(focus)
-        if (bounds != null && longPressAt(bounds)) {
+        if (bounds == null) logLine("no click bounds and no focus bounds, skip long-press")
+        if (bounds != null && canGesture && longPressAt(bounds)) {
             logLine("long-press at $bounds, waiting for menu")
             Thread.sleep(800)
             if (clickByText("复制", "Copy", "拷贝", "复制文本")) {
@@ -201,6 +250,15 @@ class CopyAccessibilityService : AccessibilityService() {
             }
             Thread.sleep(400)
             saveClipboard(before)
+            return
+        }
+
+        // 5) 最后兜底：读不到选中状态、也找不到复制按钮时，
+        //    直接把当前页面可见文字整体保存（阅读类 app 最实用）
+        val pageText = readPageText()
+        if (pageText.length >= 10) {
+            logLine("STEP5: 整页文字 len=${pageText.length}")
+            saveTextDirectly(pageText, "整页文字")
             return
         }
 
@@ -286,6 +344,101 @@ class CopyAccessibilityService : AccessibilityService() {
         null
     }
 
+    // ---------------- 直接读文字（不依赖剪贴板/手势/按钮） ----------------
+
+    /** 读出无障碍树里所有"选中状态"的文字，拼成完整选区 */
+    private fun readSelectedText(): String? {
+        return try {
+            val sb = StringBuilder()
+            collectSelected(rootInActiveWindow, sb, 0, intArrayOf(0))
+            if (sb.isEmpty()) null else sb.toString()
+        } catch (e: Throwable) {
+            logError("readSelectedText", e)
+            null
+        }
+    }
+
+    private fun collectSelected(node: AccessibilityNodeInfo?,
+                                out: StringBuilder,
+                                depth: Int,
+                                counter: IntArray) {
+        if (node == null || depth > MAX_DEPTH || counter[0]++ > MAX_NODES) return
+        if (isOwnNode(node)) return
+        try {
+            if (node.isSelected) {
+                // 子节点也选中时由子节点负责收集，避免父节点重复拼接
+                var childSelected = false
+                val cc = node.childCount
+                for (i in 0 until cc) {
+                    val c = try { node.getChild(i) } catch (_: Throwable) { null }
+                    if (c != null && try { c.isSelected } catch (_: Throwable) { false }) {
+                        childSelected = true
+                        break
+                    }
+                }
+                val t = try { node.text?.toString() } catch (_: Throwable) { null }
+                if (!childSelected && !t.isNullOrEmpty()) out.append(t)
+            }
+            val childCount = node.childCount
+            for (i in 0 until childCount) {
+                val c = try { node.getChild(i) } catch (_: Throwable) { null }
+                collectSelected(c, out, depth + 1, counter)
+            }
+        } catch (_: Throwable) {}
+    }
+
+    /** 取出当前页面所有可见文字（最后的兜底） */
+    private fun readPageText(): String {
+        return try {
+            val sb = StringBuilder()
+            collectText(rootInActiveWindow, sb, 0, intArrayOf(0))
+            sb.toString().trim()
+        } catch (e: Throwable) {
+            logError("readPageText", e)
+            ""
+        }
+    }
+
+    private fun collectText(node: AccessibilityNodeInfo?,
+                            out: StringBuilder,
+                            depth: Int,
+                            counter: IntArray) {
+        if (node == null || depth > MAX_DEPTH || counter[0]++ > MAX_NODES) return
+        if (isOwnNode(node)) return
+        try {
+            val visible = try { node.isVisibleToUser } catch (_: Throwable) { false }
+            if (!visible) return
+            val t = try { node.text?.toString()?.trim() } catch (_: Throwable) { null }
+            if (!t.isNullOrEmpty()) out.append(t).append('\n')
+            val childCount = node.childCount
+            for (i in 0 until childCount) {
+                val c = try { node.getChild(i) } catch (_: Throwable) { null }
+                collectText(c, out, depth + 1, counter)
+            }
+        } catch (_: Throwable) {}
+    }
+
+    /** 拿到文字后：写剪贴板 + 保存文件（不读剪贴板，避开后台读取限制） */
+    private fun saveTextDirectly(text: String, label: String) {
+        if (text.isBlank()) {
+            toast("读到的文字为空")
+            return
+        }
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("AutoCopy", text))
+        } catch (e: Throwable) {
+            logLine("setPrimaryClip failed: ${e.message}")
+        }
+        val name = TextSaver.save(this, text)
+        if (name == null) {
+            toast("保存失败，看 diag.log")
+            return
+        }
+        logLine("saved[$label] $name len=${text.length}")
+        toast("已复制[$label]：$name（${text.length} 字）")
+    }
+
     private fun safeFocusNode(): AccessibilityNodeInfo? {
         return try {
             val root = rootInActiveWindow ?: return null
@@ -305,7 +458,11 @@ class CopyAccessibilityService : AccessibilityService() {
             val ws = windows ?: return false
             for (w in ws) {
                 try {
-                    if (clickInRoot(w.root, labels)) return true
+                    val r = w.root ?: continue
+                    // 关键：跳过自己的悬浮窗。悬浮按钮自身的文字就是"复制"，
+                    // 不排除会点到自己，造成无限递归点击
+                    if (isOwnNode(r)) continue
+                    if (clickInRoot(r, labels)) return true
                 } catch (e: Throwable) {
                     logError("clickByText window root", e)
                 }
@@ -316,21 +473,40 @@ class CopyAccessibilityService : AccessibilityService() {
         return false
     }
 
+    private fun isOwnNode(n: AccessibilityNodeInfo?): Boolean =
+        try { n != null && n.packageName == packageName } catch (_: Throwable) { false }
+
+    /**
+     * 精确匹配文字：findAccessibilityNodeInfosByText 是子串匹配，
+     * 用 "Copy" 去搜会命中桌面上的 "AutoCopy" 图标，必须再做一次全等校验。
+     */
+    private fun matchesLabel(n: AccessibilityNodeInfo, label: String): Boolean {
+        val text = try { n.text?.toString()?.trim() } catch (_: Throwable) { null }
+        val desc = try { n.contentDescription?.toString()?.trim() } catch (_: Throwable) { null }
+        return text.equals(label, ignoreCase = true) ||
+                desc.equals(label, ignoreCase = true)
+    }
+
     private fun clickInRoot(root: AccessibilityNodeInfo?,
                             labels: Array<out String>): Boolean {
         root ?: return false
+        if (isOwnNode(root)) return false
         val counter = intArrayOf(0)
         for (label in labels) {
             try {
                 val nodes = root.findAccessibilityNodeInfosByText(label) ?: continue
                 for (node in nodes) {
                     if (counter[0]++ > MAX_NODES) return false
+                    if (isOwnNode(node)) continue
+                    val visible = try { node.isVisibleToUser } catch (_: Throwable) { false }
+                    if (!visible) continue
+                    if (!matchesLabel(node, label)) continue
                     var n: AccessibilityNodeInfo? = node
                     var depth = 0
                     while (n != null && depth++ < MAX_DEPTH) {
                         try {
-                            if (n.isClickable && n.isEnabled) {
-                                logLine("click node label=$label node=$n")
+                            if (!isOwnNode(n) && n.isClickable && n.isEnabled) {
+                                logLine("click node label=$label pkg=${n.packageName} node=$n")
                                 if (n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
                                     return true
                                 }
